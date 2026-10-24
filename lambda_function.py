@@ -1061,3 +1061,4 @@ def tratar_troca_codigo(params):
             }
     finally:
         conn.close()
+# teste

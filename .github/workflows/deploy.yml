@@ -3,7 +3,7 @@ name: Deploy Zentrix to AWS Lambda
 on:
   push:
     branches:
-      - main
+      - master
 
 jobs:
   deploy:
