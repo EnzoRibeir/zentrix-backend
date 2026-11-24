@@ -10,23 +10,28 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout do código
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
 
       - name: Configurar Python
-        uses: actions/setup-python@v4
+        uses: actions/setup-python@v5
         with:
-          python-version: '3.10'
+          python-version: '3.12'
 
-      - name: Instalar dependências e empacotar
+      - name: Instalar dependências e empacotar artefato limpo
         run: |
-          pip install -r requirements.txt -t .
-          zip -r deploy.zip . -x "*.git*"
+          mkdir -p package
+          if [ -s requirements.txt ] && grep -Eqv '^\s*(#|$)' requirements.txt; then
+            pip install -r requirements.txt -t package/
+          fi
+          cp lambda_function.py package/
+          cd package
+          zip -r ../deploy.zip . -x "*__pycache__*" "*.pyc" "*.pyo"
 
       - name: Deploy para AWS Lambda
         uses: appleboy/lambda-action@v0.2.0
         with:
           aws_access_key_id: ${{ secrets.AWS_ACCESS_KEY_ID }}
           aws_secret_access_key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          aws_region: sa-east-1 
-          function_name: api-financas-ia 
+          aws_region: sa-east-1
+          function_name: api-financas-ia
           zip_file: deploy.zip

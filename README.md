@@ -1,104 +1,90 @@
-# Zentrix 📱💸
+# Zentrix — Backend Serverless 📱💸
 
-**Zentrix** é um ecossistema inteligente de controle financeiro multiplataforma desenvolvido como projeto interdisciplinar universitário. Diferente de aplicativos tradicionais, ele mescla um frontend rico e moderno com um backend serverless potencializado por Inteligência Artificial (Google Gemini) e autenticação segura via Telegram.
+**Zentrix** é um ecossistema inteligente de controle financeiro multiplataforma desenvolvido como projeto interdisciplinar universitário. Ele combina um aplicativo moderno multiplataforma com um backend serverless potencializado por Inteligência Artificial (**Google Gemini 2.5 Flash**), persistência NoSQL de baixa latência (**Amazon DynamoDB**) e autenticação criptográfica via **Telegram**.
 
-O projeto foi inteiramente arquitetado com foco na **Segurança da Informação** (utilizando a metodologia de modelagem de ameaças **STRIDE**), alta escalabilidade e uma excelente Experiência de Usuário (UX).
+O projeto foi arquitetado com foco em **Segurança da Informação** (modelagem de ameaças **STRIDE**), alta escalabilidade sob demanda e excelente Experiência de Usuário (UX).
+
+---
+
+## 🗂️ Organização dos Repositórios
+
+O ecossistema Zentrix é dividido em dois repositórios independentes:
+
+* **`zentrix-app` (este repositório — Backend Serverless):** Contém a função AWS Lambda (`lambda_function.py`), scripts de provisionamento do Amazon DynamoDB (`utils/db_scripts/dynamodb.py`), pipeline CI/CD de deploy automatizado (`.github/workflows/deploy.yml`) e a suíte de testes automatizados (`tests/test_lambda.py`).
+* **`zentrix-frontend` (Aplicativo Mobile & Web):** Aplicação cliente desenvolvida em **React Native + Expo**, responsável pelo Dashboard interativo, gráficos de categorias, gestão de limites, importação de faturas CSV e fluxo de login com Deep Link.
 
 ---
 
 ## 🏗️ Arquitetura do Sistema
 
-O Zentrix opera de forma distribuída, separando claramente as responsabilidades entre cliente e servidor, garantindo segurança e escalabilidade.
-
-1. **Frontend (App Mobile & Web):** Desenvolvido em React Native via Expo. É a camada de interação direta com o usuário, projetada para ser responsiva, rápida e focada em micro-animações para uma interface premium.
-2. **Backend (Serverless / AWS Lambda):** Desenvolvido em Python 3.11. Atua como intermediário seguro da aplicação. Não há servidores rodando 24/7; a arquitetura é baseada em eventos, o que reduz custos e superfície de ataques.
-3. **Banco de Dados (AWS RDS MySQL):** Banco relacional em nuvem, armazenando informações de usuários, sessões temporárias e transações criptografadas.
-4. **Inteligência Artificial (Google Gemini 2.5 Flash):** Através do Bot do Telegram, o usuário pode enviar um áudio ou digitar de forma livre (ex: *"Gastei 50 reais no ifood parcelado em 2x"*). A IA processa a linguagem natural (NLP), extrai categorias, datas, valores e parcelas, enviando o JSON estruturado para o Backend.
-5. **Autenticação (Telegram Login Widget):** Em vez de armazenar senhas brutas no banco, delegamos a segurança de credenciais ao Telegram, validando as sessões internamente com tokens opacos (UUIDs) e criptografia HMAC-SHA256.
-
----
-
-## 🚀 Como o App Funciona?
-
-O aplicativo possui dois principais pontos de entrada e gestão:
-* **O App Zentrix:** Onde o usuário pode visualizar seu *Dashboard* inteligente, que calcula automaticamente parcelas de compras antigas que estão incidindo no mês atual. O usuário tem visão de relatórios gráficos de categorias, balanço de limites e edição de perfil.
-* **O Bot do Telegram (ZentrixBot):** Um assistente financeiro no chat. O usuário cadastra despesas usando linguagem natural e pode pedir um `/resumo` que utiliza o Google Gemini para analisar os gastos e gerar *insights* personalizados sobre as finanças do mês.
+1. **Frontend (`zentrix-frontend` — Mobile & Web):** Desenvolvido em React Native via Expo, consumindo a API REST via HTTPS com suporte completo a preflight CORS (`OPTIONS`) e autenticação Bearer.
+2. **Backend (`zentrix-app` — AWS Lambda / Python):** Arquitetura 100% orientada a eventos via Amazon API Gateway + AWS Lambda, eliminando servidores ociosos e reduzindo custos e superfície de ataque.
+3. **Banco de Dados NoSQL (Amazon DynamoDB):** Armazenamento gerenciado em modo `PAY_PER_REQUEST` (On-Demand), estruturado em três tabelas isoladas:
+   - `ZentrixUsers` (`PK`: `id` — ID do usuário no Telegram, perfil e limites financeiros).
+   - `ZentrixSessions` (`PK`: `token` — sessões opacas UUIDv4 com expiração + **GSI Sparse `auth_code-index`** sobre `auth_code` para troca segura de código temporário de uso único).
+   - `ZentrixTransactions` (`PK`: `user_id`, `SK`: `id` — chave primária composta que isola nativamente as transações por usuário e viabiliza consultas paginadas de alta performance).
+4. **Inteligência Artificial (Google Gemini 2.5 Flash):** Processa frases em linguagem natural (via API ou Bot do Telegram), categoriza faturas CSV do C6 Bank em lote e gera *insights* financeiros personalizados sobre o orçamento mensal.
+5. **Autenticação (Telegram Login Widget + Fluxo `auth_code`):** Delegação de credenciais ao Telegram validada por assinatura `HMAC-SHA256` e troca de código temporário (`auth_code` válido por 10 minutos) por `token_sessao`, evitando exposição de tokens sensíveis em URLs ou logs de navegação.
 
 ---
 
 ## 🛡️ Segurança e o Modelo STRIDE
 
-Toda a arquitetura do Zentrix foi construída com o princípio *Security by Design*, mapeando e mitigando ameaças baseadas no modelo **STRIDE** da Microsoft.
+Toda a arquitetura do Zentrix aplica *Security by Design*, mapeando e mitigando ameaças segundo o modelo **STRIDE**:
 
-### S - Spoofing (Falsificação de Identidade)
-* **Mitigação:** O login clássico com senhas vulneráveis foi substituído pelo **Telegram Login Widget**. O servidor valida rigorosamente a autenticidade dos dados gerando um hash `HMAC-SHA256` utilizando o Token Secreto do Bot. As sessões internas utilizam Tokens Aleatórios Fortes (UUIDv4) com tempo de expiração rigoroso.
+### S — Spoofing (Falsificação de Identidade)
+* **Mitigação:** Autenticação via **Telegram Login Widget** verificada com `HMAC-SHA256` em tempo constante (`hmac.compare_digest`) e janela máxima de 24h (`auth_date`). No fluxo mobile/deep link, um `auth_code` efêmero (10 min) é trocado uma única vez na rota `trocar-codigo` (removendo o atributo `auth_code` do item e retirando-o automaticamente do GSI Sparse `auth_code-index`). Webhooks do Bot validam o cabeçalho `X-Telegram-Bot-Api-Secret-Token`, e URIs de redirecionamento passam por whitelist estrita (`_validar_redirect_uri`) contra *Open Redirect*.
 
-### T - Tampering (Adulteração de Dados)
-* **Mitigação:** Consultas ao banco de dados utilizam exclusivamente **Parameterized Queries** (Prepared Statements) da biblioteca `pymysql`, neutralizando completamente ataques de *SQL Injection*. Na comunicação API, as políticas de **CORS** bloqueiam requisições de origens não autorizadas. 
+### T — Tampering (Adulteração de Dados)
+* **Mitigação:** Prevenção contra *NoSQL Injection* e colisão de palavras reservadas através do SDK `boto3` fortemente tipado (`KeyConditionExpression`, `ExpressionAttributeNames`, `ExpressionAttributeValues`, `ConditionExpression` e conversão rigorosa para `Decimal`). Entradas passam por validação estrita de domínio (`MINHAS_CATEGORIAS`, `TIPOS_PERMITIDOS`, valores positivos e limites de perfil).
 
-### R - Repudiation (Repúdio)
-* **Mitigação:** Logs de sistema detalhados são mantidos pelo AWS CloudWatch (sem dados sensíveis). Todas as transações estão atreladas a um identificador imutável do usuário no banco de dados.
+### R — Repudiation (Repúdio)
+* **Mitigação:** Logs operacionais estruturados no AWS CloudWatch sem exposição de segredos ou tokens, e vínculo imutável de cada transação à chave de partição `user_id` e timestamp ISO 8601 (`created_at`).
 
-### I - Information Disclosure (Vazamento de Informações)
-* **Mitigação:** 
-  1. A comunicação entre o App e a API é feita exclusivamente sobre TLS 1.2+ (HTTPS).
-  2. Tratamento rigoroso de Erros (Status 500) que não expõem *Tracebacks* da linguagem ou versões do servidor para o cliente.
-  3. No banco de dados, senhas brutas nunca existiram. Em versões iniciais de testes, foram desativadas e substituídas pela dupla camada de Autenticação do Telegram.
-  4. Dados enviados para a IA (Gemini) sofrem sanitização; processa-se apenas o prompt e o extrato financeiro sob demanda temporária.
+### I — Information Disclosure (Vazamento de Informações)
+* **Mitigação:**
+  1. Tráfego exclusivamente sobre TLS 1.2+ (HTTPS).
+  2. Tratamento global de exceções (HTTP 500) e erros no processamento do Bot do Telegram que registram falhas apenas internamente, **nunca** expondo `str(e)` ou *stack traces* ao usuário final.
+  3. Remoção explícita de atributos internos (`password_hash`) nas respostas de perfil e não armazenamento da frase bruta original (`raw_input_phrase`).
+  4. Sanitização de HTML e caracteres de controle (`sanitizar_frase`) antes de qualquer envio ao modelo Gemini.
 
-### D - Denial of Service (Negação de Serviço)
-* **Mitigação:** A infraestrutura **Serverless (AWS Lambda)** garante escalonamento horizontal automático frente a picos de requisições. Para relatórios pesados (como exportação de CSV), existem limites rígidos de linhas por consulta para evitar consumo excessivo de memória (OOM).
+### D — Denial of Service (Negação de Serviço)
+* **Mitigação:** Escalonamento automático via AWS Lambda e DynamoDB `PAY_PER_REQUEST`, limite rígido de **1 MB** para importação de arquivos CSV (HTTP `413`) e paginação completa via `LastEvaluatedKey`.
 
-### E - Elevation of Privilege (Elevação de Privilégio)
-* **Mitigação:** Inexistência de vulnerabilidades **IDOR** (Insecure Direct Object Reference). Em todas as rotas (DELETE, PUT, GET), o recurso sempre inclui a validação `AND user_id = %s`. Um usuário autenticado nunca conseguirá excluir, editar ou ler transações de outro usuário, mesmo adivinhando o ID da transação no payload da requisição.
-
----
-
-## 🎨 Como foi feito o Frontend
-
-O design foca na experiência nativa (*Premium Feel*) do usuário, abolindo layouts complexos em prol de usabilidade clara.
-
-- **Tecnologias:** Desenvolvido no ecossistema **React Native** suportado pelo framework **Expo** (SDK 54).
-- **Gestão de Estado Global:** Evitando dependências externas (como Redux), todo o controle financeiro, de autenticação e de modo Dark/Light é gerenciado eficientemente pela **Context API** nativa do React.
-- **Animações e Interações:** Micro-animações em modais, feedback visual imediato para falhas e navegação suave feita através do `React Navigation`.
-- **Organização de Código (Modularização):** 
-  - `/src/componentes/`: Interfaces reutilizáveis (Botões, Modais, Cards).
-  - `/src/telas/`: Telas e exibições inteiras geridas pelo roteador.
-  - `/src/utilitarios/`: Motor de cálculo isolado (rateio de parcelamentos dinâmicos ao longo dos meses).
-  - `/src/servicos/`: Centralização do wrapper `fetch` para comunicação segura com a API AWS, injetando automaticamente os JWT Tokens.
+### E — Elevation of Privilege (Elevação de Privilégio)
+* **Mitigação:** Proteção nativa contra **IDOR** (*Insecure Direct Object Reference*): todas as rotas autenticadas validam se o Bearer `token` pertence exatamente ao `user_id` requisitado, e todas as operações em `ZentrixTransactions` utilizam a chave composta `{user_id, id}` aliada a `ConditionExpression='attribute_exists(user_id) AND attribute_exists(id)'`.
 
 ---
 
-## 🛠️ Como Instalar e Rodar Localmente
+## 🧪 Como Executar os Testes Localmente (`zentrix-app`)
 
-Certifique-se de ter instalado no seu ambiente de desenvolvimento:
-- [Node.js](https://nodejs.org/en/)
-- O gerenciador de pacotes **Yarn**
-- O aplicativo **Expo Go** no seu smartphone (Android/iOS)
-
-### Passo a Passo
-
-1. Clone o repositório e navegue até a pasta do frontend:
+1. Crie e ative um ambiente virtual Python (3.11+):
 ```bash
-git clone https://github.com/SEU-USUARIO/zentrix.git
-cd zentrix/zentrix-app/front_v2
+python -m venv .venv
+# Windows (PowerShell)
+.\.venv\Scripts\Activate.ps1
+# Linux / macOS
+source .venv/bin/activate
 ```
 
-2. Instale as dependências rigorosas da aplicação utilizando o Yarn:
+2. Instale as dependências de desenvolvimento:
 ```bash
-yarn install
+pip install -r requirements-dev.txt
 ```
+*(Nota: `requirements.txt` permanece vazio pois na AWS Lambda o `boto3` já faz parte do runtime oficial e `google-genai` é provido via Lambda Layer.)*
 
-3. Inicie o servidor do Metro Bundler (recomendável com limpeza de cache):
+3. Execute a suíte completa de testes automatizados:
 ```bash
-npx expo start -c
+pytest -v
+# ou usando unittest nativo:
+python -m unittest discover -s tests -v
 ```
-
-4. **Testando no Smartphone:**
-   - **Para iOS:** Abra a câmera do seu celular e escaneie o QR Code que apareceu no terminal.
-   - **Para Android:** Baixe o aplicativo "Expo Go", abra-o, e clique em "Scan QR Code".
-
-Pronto! A interface estará rodando no seu dispositivo e já se comunicando ativamente com o backend Serverless configurado na nuvem.
 
 ---
-*Projeto Interdisciplinar - Criado com foco total em Engenharia de Software Segura e Inovação Financeira.*
+
+## 📱 Frontend (`zentrix-frontend`)
+
+Para executar o aplicativo mobile/web em React Native + Expo, consulte o repositório dedicado **`zentrix-frontend`**.
+
+---
+*Projeto Interdisciplinar — Engenharia de Software Segura, Arquitetura Serverless e Inovação Financeira.*

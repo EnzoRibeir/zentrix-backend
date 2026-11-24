@@ -1,37 +1,48 @@
+import csv
+import datetime
+import hashlib
+import hmac
+import io
 import json
 import os
 import re
 import time
-import csv
-import io
-import boto3
-import urllib.request
 import urllib.parse
-import hashlib
-import hmac
+import urllib.request
 import uuid
-import datetime
 from decimal import Decimal
+
+import boto3
 from boto3.dynamodb.conditions import Key
+from botocore.exceptions import ClientError
 from google import genai
 
 # ============================================================
 # 1. CONFIGURAÇÕES E CREDENCIAIS
 # ============================================================
-client = genai.Client(api_key=os.environ.get('GEMINI_API_KEY'))
+_GEMINI_API_KEY = os.environ.get('GEMINI_API_KEY')
+client = genai.Client(api_key=_GEMINI_API_KEY) if _GEMINI_API_KEY else None
 MODEL_ID = 'gemini-2.5-flash'
 
-TELEGRAM_TOKEN        = os.environ.get('TELEGRAM_TOKEN')
+TELEGRAM_TOKEN        = os.environ.get('TELEGRAM_TOKEN', '')
 # SEC10: Segredo configurado no BotFather para validar webhooks do bot
 TELEGRAM_SECRET_TOKEN = os.environ.get('TELEGRAM_SECRET_TOKEN', '')
 ZENTRIX_USER_ID       = os.environ.get('ZENTRIX_USER_ID', '')
 
-# SEC09: Manter * apenas nas rotas públicas. Rotas autenticadas não precisam de CORS
-# pois são chamadas diretamente pelo React Native (não pelo browser).
-CORS_PUBLICO = {'Access-Control-Allow-Origin': '*'}
+DEFAULT_API_BASE_URL = (
+    'https://agog0k90kc.execute-api.sa-east-1.amazonaws.com/default/api-financas-ia'
+)
+DEFAULT_APP_REDIRECT_URI = 'zentrix://auth/callback'
+
+CORS_HEADERS = {
+    'Access-Control-Allow-Origin': '*',
+    'Access-Control-Allow-Headers': 'Content-Type, Authorization, X-Telegram-Bot-Api-Secret-Token',
+    'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS',
+}
 
 # DynamoDB — inicializado uma vez no cold start da Lambda (connection reuse)
-_dynamodb          = boto3.resource('dynamodb')
+_AWS_REGION        = os.environ.get('AWS_REGION') or os.environ.get('AWS_DEFAULT_REGION') or 'sa-east-1'
+_dynamodb          = boto3.resource('dynamodb', region_name=_AWS_REGION)
 table_users        = _dynamodb.Table('ZentrixUsers')
 table_sessions     = _dynamodb.Table('ZentrixSessions')
 table_transactions = _dynamodb.Table('ZentrixTransactions')
@@ -41,12 +52,27 @@ MINHAS_CATEGORIAS = [
     "Assinaturas", "Compras e Mimos", "A receber", "Outros"
 ]
 
+TIPOS_PERMITIDOS = [
+    "Débito", "Crédito à Vista", "Crédito Parcelado", "Emprestado"
+]
+
+
 # ============================================================
-# 2. UTILITÁRIOS
+# 2. UTILITÁRIOS E SEGURANÇA
 # ============================================================
+
+def _obter_cliente_ia():
+    """Retorna o cliente Gemini inicializado (suporta injeção de mock em `client`)."""
+    global client
+    if client is None:
+        client = genai.Client(api_key=os.environ.get('GEMINI_API_KEY'))
+    return client
+
 
 def _to_decimal(value):
     """Converte float/int para Decimal (exigido pelo boto3 no put_item/update_item)."""
+    if isinstance(value, bool):
+        raise ValueError("Booleano não é um número válido.")
     if isinstance(value, float):
         return Decimal(str(value))
     if isinstance(value, int):
@@ -55,10 +81,177 @@ def _to_decimal(value):
 
 
 def _decimal_default(obj):
-    """Serializador JSON para converter Decimal → float nas respostas HTTP."""
+    """Serializador JSON para converter Decimal -> float nas respostas HTTP."""
     if isinstance(obj, Decimal):
         return float(obj)
     raise TypeError(f"Object of type {type(obj)} is not JSON serializable")
+
+
+def _resposta(status_code, payload, extra_headers=None):
+    """Monta resposta HTTP padronizada em JSON com headers de CORS."""
+    headers = {
+        **CORS_HEADERS,
+        'Content-Type': 'application/json',
+    }
+    if extra_headers:
+        headers.update(extra_headers)
+    body = '' if status_code == 204 and payload == '' else json.dumps(payload, default=_decimal_default)
+    return {
+        'statusCode': status_code,
+        'headers': headers,
+        'body': body,
+    }
+
+
+def _resposta_nao_autorizado():
+    return _resposta(401, {'erro': 'Nao autorizado.'})
+
+
+def _resposta_erro_json():
+    return _resposta(400, {'erro': 'Corpo da requisicao invalido.'})
+
+
+def _validar_redirect_uri(uri):
+    """
+    SEC – Previne Open Redirect / XSS em deep links e callbacks de login.
+    Permite apenas:
+      - zentrix://, exp://, exps://
+      - http://localhost, http://127.0.0.1
+      - https://
+    Qualquer valor fora da whitelist faz fallback seguro para 'zentrix://auth/callback'.
+    """
+    if not uri or not isinstance(uri, str):
+        return DEFAULT_APP_REDIRECT_URI
+
+    uri_limpa = uri.strip()
+    if not uri_limpa or re.search(r'[\x00-\x20\\]', uri_limpa):
+        return DEFAULT_APP_REDIRECT_URI
+
+    try:
+        parsed = urllib.parse.urlparse(uri_limpa)
+    except ValueError:
+        return DEFAULT_APP_REDIRECT_URI
+
+    scheme = (parsed.scheme or '').lower()
+
+    if scheme in ('zentrix', 'exp', 'exps'):
+        if uri_limpa.lower().startswith(f'{scheme}://') and (parsed.netloc or parsed.path):
+            return uri_limpa
+        return DEFAULT_APP_REDIRECT_URI
+
+    if scheme == 'http':
+        if parsed.hostname in ('localhost', '127.0.0.1'):
+            return uri_limpa
+        return DEFAULT_APP_REDIRECT_URI
+
+    if scheme == 'https':
+        if parsed.hostname:
+            return uri_limpa
+        return DEFAULT_APP_REDIRECT_URI
+
+    return DEFAULT_APP_REDIRECT_URI
+
+
+def _extrair_json_ia(texto):
+    """
+    Remove cercas markdown (```json ... ```) e extrai o primeiro objeto `{...}`
+    ou array `[...]` JSON válido caso o modelo adicione texto extra.
+    """
+    if not texto or not isinstance(texto, str):
+        raise ValueError("Resposta vazia da IA.")
+
+    limpo = texto.strip()
+    limpo = re.sub(r'^```(?:json)?\s*', '', limpo, flags=re.IGNORECASE)
+    limpo = re.sub(r'\s*```$', '', limpo).strip()
+
+    try:
+        return json.loads(limpo)
+    except json.JSONDecodeError:
+        pass
+
+    decoder = json.JSONDecoder()
+    for idx, ch in enumerate(limpo):
+        if ch in ('{', '['):
+            try:
+                obj, _ = decoder.raw_decode(limpo[idx:])
+                return obj
+            except json.JSONDecodeError:
+                continue
+
+    raise ValueError("Nenhum JSON válido encontrado na resposta da IA.")
+
+
+def _normalizar_dados_transacao_ia(dados):
+    """Normaliza e valida categoria, tipo, parcelas e descrição vindos da IA."""
+    if not isinstance(dados, dict):
+        raise ValueError("Formato de transação inválido retornado pela IA.")
+
+    raw_type = dados.get('type')
+    raw_cat = dados.get('category')
+
+    if raw_type in TIPOS_PERMITIDOS:
+        tipo = raw_type
+    elif raw_cat == 'A receber':
+        tipo = 'Emprestado'
+    else:
+        tipo = 'Crédito à Vista'
+
+    if raw_cat in MINHAS_CATEGORIAS:
+        categoria = raw_cat
+    else:
+        categoria = 'A receber' if tipo == 'Emprestado' else 'Outros'
+
+    try:
+        installments_total = max(1, int(dados.get('installments') or 1))
+    except (ValueError, TypeError):
+        installments_total = 1
+
+    descricao = sanitizar_frase(str(dados.get('description') or ''), max_chars=200) or 'Transação'
+
+    raw_amount = dados.get('amount')
+    if isinstance(raw_amount, bool):
+        valor = -1.0
+    else:
+        try:
+            valor = float(raw_amount)
+        except (ValueError, TypeError):
+            valor = -1.0
+
+    debtor_name = dados.get('debtor_name')
+    if isinstance(debtor_name, str):
+        debtor_name = sanitizar_frase(debtor_name, max_chars=120) or None
+    else:
+        debtor_name = None
+
+    return {
+        'description': descricao,
+        'amount': valor,
+        'category': categoria,
+        'type': tipo,
+        'installments': installments_total,
+        'debtor_name': debtor_name,
+    }
+
+
+def _listar_transacoes_usuario(user_id):
+    """
+    Lista todas as transações ativas do usuário no DynamoDB iterando
+    por todas as páginas (`LastEvaluatedKey`) e filtrando `status == 'deleted'`.
+    """
+    itens = []
+    kwargs = {
+        'KeyConditionExpression': Key('user_id').eq(str(user_id))
+    }
+    while True:
+        resp = table_transactions.query(**kwargs)
+        for tx in resp.get('Items', []):
+            if tx.get('status') != 'deleted':
+                itens.append(tx)
+        last_key = resp.get('LastEvaluatedKey')
+        if not last_key:
+            break
+        kwargs['ExclusiveStartKey'] = last_key
+    return itens
 
 
 def enviar_mensagem_telegram(chat_id, texto):
@@ -92,13 +285,16 @@ def validar_sessao(event, user_id):
     """
     SEC01 – Verifica se o token Bearer no header Authorization
     pertence ao user_id e ainda está dentro do prazo de expiração.
-    Substituição: SELECT sessions WHERE token → get_item na ZentrixSessions.
     """
+    if not user_id:
+        return False
     headers = event.get('headers', {}) or {}
     auth_header = headers.get('Authorization') or headers.get('authorization')
     if not auth_header or not auth_header.startswith('Bearer '):
         return False
-    token = auth_header.split(' ', 1)[1]
+    token = auth_header.split(' ', 1)[1].strip()
+    if not token:
+        return False
 
     try:
         resp    = table_sessions.get_item(Key={'token': token})
@@ -120,29 +316,12 @@ def validar_sessao(event, user_id):
         return False
 
 
-def _resposta_nao_autorizado():
-    return {
-        'statusCode': 401,
-        'body': json.dumps({'erro': 'Nao autorizado.'})
-    }
-
-
-def _resposta_erro_json():
-    return {
-        'statusCode': 400,
-        'body': json.dumps({'erro': 'Corpo da requisicao invalido.'})
-    }
-
-
 # ============================================================
 # 3. RESUMO / INSIGHT IA
 # ============================================================
 
 def _upsert_usuario_telegram(user_telegram_id, first_name):
-    """
-    Busca ou cria usuário pelo ID do Telegram. Retorna o id final (string).
-    Substituição: SELECT + INSERT INTO usuarios → get_item + put_item na ZentrixUsers.
-    """
+    """Busca ou cria usuário pelo ID do Telegram. Retorna o id final (string)."""
     user_id_str = str(user_telegram_id)
     resp        = table_users.get_item(Key={'id': user_id_str})
     if resp.get('Item'):
@@ -159,53 +338,38 @@ def _upsert_usuario_telegram(user_telegram_id, first_name):
 
 def obter_resumo_usuario(user_id):
     """
-    Consolida dados do mês e aciona o Gemini para gerar insights financeiros.
-
-    Substituição das queries SQL com SUM/GROUP BY/PERIOD_DIFF:
-    → query() busca TODAS as transações do user_id.
-    → Filtragem de mês, rateio de parcelas e somatória são feitos em Python (in-memory).
-
-    Lógica de rateio:
-    - Transações à vista (installments_total <= 1): incluídas apenas se criadas no mês/ano atual.
-    - Transações parceladas (Crédito Parcelado / Emprestado, installments_total > 1):
-        diff_meses = (ano_atual*12 + mes_atual) - (ano_criação*12 + mes_criação)
-        Incluída se 0 <= diff_meses < installments_total.
-        Valor efetivo = amount / installments_total.
+    Consolida dados do mês atual separando despesas (`total_gasto`) de valores
+    emprestados (`total_receber`), alinhado com as regras do frontend.
     """
     resp_user = table_users.get_item(Key={'id': str(user_id)})
     user_info = resp_user.get('Item')
     if not user_info:
         return None
 
-    resp_tx          = table_transactions.query(
-        KeyConditionExpression=Key('user_id').eq(str(user_id))
-    )
-    todas_transacoes = resp_tx.get('Items', [])
+    todas_transacoes = _listar_transacoes_usuario(user_id)
 
     agora     = datetime.datetime.now()
     ano_atual = agora.year
     mes_atual = agora.month
 
-    total_geral             = 0.0
+    total_gasto             = 0.0
+    total_receber           = 0.0
     distribuicao_categorias = {}
 
     for tx in todas_transacoes:
-        if tx.get('status') == 'deleted':
-            continue
         try:
             created_at = datetime.datetime.fromisoformat(tx.get('created_at', ''))
         except (ValueError, TypeError):
             continue
 
         tipo               = tx.get('type', '')
-        installments_total = int(tx.get('installments_total') or 1)
+        installments_total = max(1, int(tx.get('installments_total') or 1))
         amount             = float(tx.get('amount') or 0)
         categoria          = tx.get('category', 'Outros')
 
         eh_parcelado = tipo in ('Crédito Parcelado', 'Emprestado') and installments_total > 1
 
         if eh_parcelado:
-            # Equivalente ao PERIOD_DIFF do MySQL, calculado em Python
             diff_meses = (ano_atual * 12 + mes_atual) - (created_at.year * 12 + created_at.month)
             if not (0 <= diff_meses < installments_total):
                 continue
@@ -215,39 +379,49 @@ def obter_resumo_usuario(user_id):
                 continue
             valor_efetivo = amount
 
-        total_geral += valor_efetivo
-        distribuicao_categorias[categoria] = (
-            distribuicao_categorias.get(categoria, 0.0) + valor_efetivo
-        )
+        if tipo == 'Emprestado':
+            total_receber += valor_efetivo
+        else:
+            total_gasto += valor_efetivo
+            distribuicao_categorias[categoria] = (
+                distribuicao_categorias.get(categoria, 0.0) + valor_efetivo
+            )
 
-    limite    = float(user_info.get('limite_mensal') or 0)
-    cat_texto = ", ".join([f"{c}: R$ {v:.2f}" for c, v in distribuicao_categorias.items()])
+    limite           = float(user_info.get('limite_mensal') or 0)
+    saldo_disponivel = limite - total_gasto
+    cat_texto        = ", ".join([f"{c}: R$ {v:.2f}" for c, v in distribuicao_categorias.items()])
 
     insight_ia = "Sem transações registradas no mês para analisar."
-    if total_geral > 0:
+    if total_gasto > 0:
         prompt_insight = f"""
         Aja como um consultor financeiro de alto nível. Analise os gastos do mês atual do usuário {user_info['nome']}:
         - Limite de Gastos Mensal: R$ {limite}
-        - Total já gasto: R$ {total_geral:.2f}
+        - Total já gasto: R$ {total_gasto:.2f}
+        - Total a receber (emprestado): R$ {total_receber:.2f}
         - Distribuição por categorias: [{cat_texto}]
 
         Dê um feedback direto, curto e motivador. Se passou do limite ou está perto, avise.
         Aponte o maior vilão e dê uma dica prática. Max 3 linhas.
         """
         try:
-            response   = client.models.generate_content(model=MODEL_ID, contents=prompt_insight)
+            ia_client  = _obter_cliente_ia()
+            response   = ia_client.models.generate_content(model=MODEL_ID, contents=prompt_insight)
             insight_ia = response.text.strip()
         except Exception as e:
             print("Erro IA Resumo:", e)
-            insight_ia = "A cota gratuita da Inteligência Artificial atingiu o limite de requisições por hoje. Volte amanhã para novos insights!"
+            insight_ia = (
+                "A cota gratuita da Inteligência Artificial atingiu o limite de requisições "
+                "por hoje. Volte amanhã para novos insights!"
+            )
 
     return {
-        'nome':                   user_info['nome'],
-        'total_gasto':            total_geral,
-        'limite_definido':        limite,
-        'saldo_disponivel':       limite - total_geral,
+        'nome':                    user_info['nome'],
+        'total_gasto':             total_gasto,
+        'total_receber':           total_receber,
+        'limite_definido':         limite,
+        'saldo_disponivel':        saldo_disponivel,
         'distribuicao_categorias': distribuicao_categorias,
-        'insight_ia':             insight_ia
+        'insight_ia':              insight_ia,
     }
 
 
@@ -256,80 +430,119 @@ def obter_resumo_usuario(user_id):
 # ============================================================
 
 def lambda_handler(event, context):
-    metodo = event.get('httpMethod') or event.get('requestContext', {}).get('http', {}).get('method')
+    event = event or {}
+    metodo = (
+        event.get('httpMethod')
+        or event.get('requestContext', {}).get('http', {}).get('method')
+    )
+    if isinstance(metodo, str):
+        metodo = metodo.upper()
 
     try:
-        if metodo == 'POST':
+        if metodo == 'OPTIONS':
+            return {
+                'statusCode': 204,
+                'headers': dict(CORS_HEADERS),
+                'body': '',
+            }
+        elif metodo is None or metodo == 'POST':
             return tratar_post(event)
         elif metodo == 'GET':
             return tratar_get(event)
-        elif metodo == 'DELETE':
-            return tratar_delete(event)
         elif metodo == 'PUT':
             return tratar_put(event)
+        elif metodo == 'DELETE':
+            return tratar_delete(event)
         else:
-            return tratar_post(event)
+            return _resposta(405, {'erro': 'Metodo nao permitido.'})
     except Exception as e:
         # SEC02: Loga internamente; nunca expõe detalhes ao cliente.
         print(f"ERRO CRÍTICO NÃO TRATADO: {str(e)}")
-        return {
-            'statusCode': 500,
-            'body': json.dumps({'erro': 'Erro interno do servidor. Tente novamente mais tarde.'})
-        }
+        return _resposta(500, {'erro': 'Erro interno do servidor. Tente novamente mais tarde.'})
 
 
 # ============================================================
-# 5. POST
+# 5. POST E PROCESSAMENTO DE CSV
 # ============================================================
+
+def _parse_data_csv(data_raw):
+    """Converte datas DD/MM/YYYY ou YYYY-MM-DD para ISO 8601, ou retorna agora."""
+    if data_raw and isinstance(data_raw, str):
+        texto = data_raw.strip()
+        for fmt in ('%d/%m/%Y', '%Y-%m-%d'):
+            try:
+                dt = datetime.datetime.strptime(texto[:10], fmt)
+                return dt.isoformat()
+            except ValueError:
+                continue
+    return datetime.datetime.now().isoformat()
 
 
 def processar_csv_c6(user_id, csv_text):
     """
-    Processa CSV do C6 Bank e salva transações no DynamoDB.
-    Substituição: INSERT INTO transacoes → put_item na ZentrixTransactions.
-    ID gerado via uuid.uuid4().hex (substitui o AUTO_INCREMENT do MySQL).
+    Processa CSV do C6 Bank (com suporte a BOM UTF-8, delimitador `;` ou `,`,
+    colunas com/sem acento e datas de compra) e salva transações no DynamoDB.
     """
-    f      = io.StringIO(csv_text.strip())
-    reader = list(csv.DictReader(f, delimiter=';'))
-    descricoes_brutas = list(set([row.get('Descrição', '') for row in reader if row.get('Descrição')]))
+    csv_limpo = (csv_text or '').lstrip('\ufeff').strip()
+    if not csv_limpo:
+        return 0
 
-    prompt_lote = f'''
-    Você é um categorizador financeiro.
-    Categorias permitidas: {MINHAS_CATEGORIAS}.
-    Analise os itens a seguir e retorne APENAS um array de objetos JSON (sem blocos de código ou aspas extras), neste formato estrito:
-    [
-      {{"orig": "NOME ORIGINAL", "limpa": "Nome Bonito", "cat": "Categoria Correta"}}
-    ]
-    Itens para analisar: {descricoes_brutas}
-    '''
-    try:
-        response = client.models.generate_content(model=MODEL_ID, contents=prompt_lote)
-        texto_ia = response.text.strip()
-    except Exception as e:
-        print("Erro IA Lote:", e)
-        texto_ia = "[]"
-    if texto_ia.startswith('```'):
-        texto_ia = texto_ia.split('\n', 1)[-1]
-        if texto_ia.endswith('```'):
-            texto_ia = texto_ia.rsplit('\n', 1)[0]
+    primeira_linha = csv_limpo.splitlines()[0]
+    delimitador = ';' if ';' in primeira_linha else ','
+
+    f = io.StringIO(csv_limpo)
+    reader = list(csv.DictReader(f, delimiter=delimitador))
+    if not reader:
+        return 0
+
+    descricoes_brutas = list({
+        (row.get('Descrição') or row.get('Descricao') or '').strip()
+        for row in reader
+        if (row.get('Descrição') or row.get('Descricao') or '').strip()
+    })
 
     mapa_categorias = {}
-    try:
-        lista_ia = json.loads(texto_ia.strip())
-        for item in lista_ia:
-            mapa_categorias[item['orig']] = {"desc_limpa": item['limpa'], "cat": item['cat']}
-    except Exception as e:
-        print("Erro ao decodificar JSON da IA:", e)
-        print("Resposta bruta:", texto_ia)
+    if descricoes_brutas:
+        prompt_lote = f'''
+        Você é um categorizador financeiro.
+        Categorias permitidas: {MINHAS_CATEGORIAS}.
+        Analise os itens a seguir e retorne APENAS um array de objetos JSON (sem blocos de código ou aspas extras), neste formato estrito:
+        [
+          {{"orig": "NOME ORIGINAL", "limpa": "Nome Bonito", "cat": "Categoria Correta"}}
+        ]
+        Itens para analisar: {descricoes_brutas}
+        '''
+        texto_ia = "[]"
+        try:
+            ia_client = _obter_cliente_ia()
+            response = ia_client.models.generate_content(model=MODEL_ID, contents=prompt_lote)
+            texto_ia = response.text.strip()
+            lista_ia = _extrair_json_ia(texto_ia)
+            if isinstance(lista_ia, list):
+                for item in lista_ia:
+                    if isinstance(item, dict) and 'orig' in item:
+                        cat_ia = item.get('cat')
+                        if cat_ia not in MINHAS_CATEGORIAS:
+                            cat_ia = 'Outros'
+                        desc_ia = sanitizar_frase(str(item.get('limpa') or ''), max_chars=100)
+                        mapa_categorias[item['orig']] = {
+                            'desc_limpa': desc_ia or str(item['orig'])[:100],
+                            'cat': cat_ia,
+                        }
+        except Exception as e:
+            print("Erro IA Lote / JSON CSV:", e)
+            print("Resposta bruta:", texto_ia)
 
     contagem = 0
     for row in reader:
-        desc_orig   = row.get('Descrição', '')
-        valor_bruto = row.get('Valor (em R$)', '0')
+        desc_orig   = (row.get('Descrição') or row.get('Descricao') or '').strip()
+        valor_bruto = str(row.get('Valor (em R$)') or row.get('Valor') or '0').replace('R$', '').strip()
+
         if ',' in valor_bruto and '.' in valor_bruto:
             valor_bruto = valor_bruto.replace('.', '').replace(',', '.')
         elif ',' in valor_bruto:
             valor_bruto = valor_bruto.replace(',', '.')
+
         try:
             valor = float(valor_bruto)
         except ValueError:
@@ -337,39 +550,56 @@ def processar_csv_c6(user_id, csv_text):
         if valor <= 0:
             continue
 
-        info_ia     = mapa_categorias.get(desc_orig, {"desc_limpa": desc_orig[:100], "cat": "Outros"})
-        parcela_raw = row.get('Parcela', 'Única')
-        total_p = paga_p = 1
-        if "/" in parcela_raw:
-            partes  = parcela_raw.split("/")
-            paga_p  = int(partes[0])
-            total_p = int(partes[1])
+        fallback_desc = sanitizar_frase(desc_orig, max_chars=100) or 'Compra C6'
+        info_ia = mapa_categorias.get(desc_orig, {'desc_limpa': fallback_desc, 'cat': 'Outros'})
+        cat_final = info_ia.get('cat') if info_ia.get('cat') in MINHAS_CATEGORIAS else 'Outros'
+        desc_final = info_ia.get('desc_limpa') or fallback_desc
 
-        tipo_movimentacao = "Crédito Parcelado" if "/" in parcela_raw else "Crédito à Vista"
-        if info_ia['cat'] == "A receber":
-            tipo_movimentacao = "Emprestado"
+        parcela_raw = str(row.get('Parcela') or 'Única').strip()
+        total_p = 1
+        paga_p = 1
+        eh_parcela_valida = False
+        if '/' in parcela_raw:
+            try:
+                partes = parcela_raw.split('/')
+                paga_p = max(1, int(partes[0].strip()))
+                total_p = max(1, int(partes[1].strip()))
+                eh_parcela_valida = total_p > 1
+            except (ValueError, IndexError):
+                paga_p = 1
+                total_p = 1
+                eh_parcela_valida = False
+
+        tipo_movimentacao = 'Crédito Parcelado' if eh_parcela_valida else 'Crédito à Vista'
+        if cat_final == 'A receber':
+            tipo_movimentacao = 'Emprestado'
+
+        data_raw = row.get('Data de Compra') or row.get('Data') or ''
+        created_at = _parse_data_csv(data_raw)
 
         table_transactions.put_item(Item={
             'user_id':            str(user_id),
-            'id':                 uuid.uuid4().hex,          # substitui AUTO_INCREMENT
-            'description':        info_ia['desc_limpa'],
-            'amount':             Decimal(str(valor)),        # Decimal obrigatório no boto3
-            'category':           info_ia['cat'],
+            'id':                 uuid.uuid4().hex,
+            'description':        desc_final,
+            'amount':             Decimal(str(valor)),
+            'category':           cat_final,
             'type':               tipo_movimentacao,
             'source':             'C6_BANK',
             'installments_total': total_p,
             'installments_paid':  paga_p,
             'status':             'active',
-            'created_at':         datetime.datetime.now().isoformat()
+            'created_at':         created_at,
         })
         contagem += 1
+
     return contagem
 
-def tratar_post(event):
 
-    # Bug fix: captura JSON inválido antes de qualquer processamento
+def tratar_post(event):
     try:
         body = json.loads(event.get('body', '{}') or '{}')
+        if not isinstance(body, dict):
+            return _resposta_erro_json()
     except json.JSONDecodeError:
         return _resposta_erro_json()
 
@@ -378,58 +608,69 @@ def tratar_post(event):
         # SEC10: Valida o secret token do webhook do Telegram Bot
         if TELEGRAM_SECRET_TOKEN:
             headers = event.get('headers', {}) or {}
-            incoming_secret = headers.get('X-Telegram-Bot-Api-Secret-Token') or \
-                              headers.get('x-telegram-bot-api-secret-token', '')
+            incoming_secret = (
+                headers.get('X-Telegram-Bot-Api-Secret-Token')
+                or headers.get('x-telegram-bot-api-secret-token', '')
+            )
             if not hmac.compare_digest(incoming_secret, TELEGRAM_SECRET_TOKEN):
                 print("SEC10: Webhook do bot recebido sem secret token válido.")
-                return {'statusCode': 200, 'body': json.dumps('Ignorado')}
+                return _resposta(200, 'Ignorado')
 
-        telegram_msg      = body.get('message', {})
-        chat_id           = telegram_msg.get('chat', {}).get('id')
-        user_telegram_id  = telegram_msg.get('from', {}).get('id')
-        first_name        = telegram_msg.get('from', {}).get('first_name', 'Usuário Telegram')
-        texto_recebido    = telegram_msg.get('text', '')
+        telegram_msg     = body.get('message', {}) or {}
+        chat_id          = telegram_msg.get('chat', {}).get('id')
+        user_telegram_id = telegram_msg.get('from', {}).get('id')
+        first_name       = telegram_msg.get('from', {}).get('first_name', 'Usuário Telegram')
+        texto_recebido   = telegram_msg.get('text', '')
 
         # ---- Processamento de Arquivos CSV via Telegram ----
         if 'document' in telegram_msg:
-            document  = telegram_msg['document']
+            document  = telegram_msg['document'] or {}
             file_name = document.get('file_name', '').lower()
 
             if not file_name.endswith('.csv'):
                 enviar_mensagem_telegram(chat_id, "⚠️ Por favor, envie apenas arquivos CSV da fatura do C6 Bank.")
-                return {'statusCode': 200, 'body': json.dumps('Not CSV')}
+                return _resposta(200, 'Not CSV')
 
             enviar_mensagem_telegram(chat_id, "⏳ Recebi seu arquivo CSV! Analisando com a IA Zentrix... aguarde um instante.")
             try:
-                # Pegar o path do arquivo
                 req_url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getFile?file_id={document['file_id']}"
                 with urllib.request.urlopen(req_url) as resp:
                     file_info = json.loads(resp.read())
                     file_path = file_info['result']['file_path']
 
-                # Baixar o arquivo
                 dl_url = f"https://api.telegram.org/file/bot{TELEGRAM_TOKEN}/{file_path}"
                 with urllib.request.urlopen(dl_url) as resp:
                     csv_bytes = resp.read()
 
                 if len(csv_bytes) > 1_048_576:
                     enviar_mensagem_telegram(chat_id, "❌ Arquivo muito grande. O limite é 1MB.")
-                    return {'statusCode': 200, 'body': json.dumps('Too large')}
+                    return _resposta(200, 'Too large')
 
-                csv_text_tg = csv_bytes.decode('utf-8')
-                id_final_u  = _upsert_usuario_telegram(user_telegram_id, first_name)
-                contagem    = processar_csv_c6(id_final_u, csv_text_tg)
+                try:
+                    csv_text_tg = csv_bytes.decode('utf-8-sig')
+                except UnicodeDecodeError:
+                    csv_text_tg = csv_bytes.decode('latin-1')
 
-                enviar_mensagem_telegram(chat_id, f"✅ Sucesso! O arquivo foi analisado e **{contagem} transações** foram salvas no seu histórico do Zentrix de forma inteligente.")
-                return {'statusCode': 200, 'body': json.dumps('CSV processado pelo Telegram')}
+                id_final_u = _upsert_usuario_telegram(user_telegram_id, first_name)
+                contagem   = processar_csv_c6(id_final_u, csv_text_tg)
+
+                enviar_mensagem_telegram(
+                    chat_id,
+                    f"✅ Sucesso! O arquivo foi analisado e **{contagem} transações** foram salvas no seu histórico do Zentrix de forma inteligente."
+                )
+                return _resposta(200, 'CSV processado pelo Telegram')
             except Exception as e:
-                enviar_mensagem_telegram(chat_id, f"❌ Ocorreu um erro ao processar o CSV: {str(e)}")
-                return {'statusCode': 200, 'body': json.dumps('Error CSV TG')}
+                # SEC02: Loga erro interno sem vazar detalhes técnicos (str(e)) ao usuário
+                print(f"Erro CSV Telegram: {e}")
+                enviar_mensagem_telegram(
+                    chat_id,
+                    "❌ Ocorreu um erro ao processar o arquivo CSV. Verifique o formato da fatura e tente novamente mais tarde."
+                )
+                return _resposta(200, 'Error CSV TG')
 
         if not texto_recebido:
             enviar_mensagem_telegram(chat_id, "⚠️ Por enquanto só consigo processar mensagens de texto.")
-            return {'statusCode': 200, 'body': json.dumps('Mensagem sem texto')}
-
+            return _resposta(200, 'Mensagem sem texto')
 
         id_final_usuario = _upsert_usuario_telegram(user_telegram_id, first_name)
 
@@ -438,11 +679,12 @@ def tratar_post(event):
             resumo = obter_resumo_usuario(id_final_usuario)
             if not resumo:
                 enviar_mensagem_telegram(chat_id, "❌ Configure suas métricas no painel antes de pedir um resumo.")
-                return {'statusCode': 200, 'body': json.dumps('Sem dados')}
+                return _resposta(200, 'Sem dados')
 
             msg_resumo = (
                 f"📊 *Resumo Financeiro - {resumo['nome']}*\n\n"
                 f"💰 *Total Gasto:* R$ {resumo['total_gasto']:.2f}\n"
+                f"🤝 *Total a Receber:* R$ {resumo['total_receber']:.2f}\n"
                 f"🎯 *Limite Mensal:* R$ {resumo['limite_definido']:.2f}\n"
                 f"💵 *Saldo Disponível:* R$ {resumo['saldo_disponivel']:.2f}\n\n"
                 f"🗂️ *Divisão por Categorias:*\n"
@@ -451,15 +693,19 @@ def tratar_post(event):
                 msg_resumo += f"  ▪️ _{cat}_: R$ {valor:.2f}\n"
             msg_resumo += f"\n💡 *Insight da IA Zentrix:*\n_{resumo['insight_ia']}_"
             enviar_mensagem_telegram(chat_id, msg_resumo)
-            return {'statusCode': 200, 'body': json.dumps('Telegram resumo enviado')}
+            return _resposta(200, 'Telegram resumo enviado')
 
         else:
             # SEC06: Sanitiza a frase antes de enviar ao Gemini
             frase_segura = sanitizar_frase(texto_recebido)
-            prompt_ia    = f"""
+            if not frase_segura:
+                enviar_mensagem_telegram(chat_id, "⚠️ Frase inválida ou vazia.")
+                return _resposta(200, 'Frase vazia')
+
+            prompt_ia = f"""
             Extraia os dados da frase: '{frase_segura}'
             Categorias: {MINHAS_CATEGORIAS}
-            Tipos permitidos: [Débito, Crédito à Vista, Crédito Parcelado, Emprestado]
+            Tipos permitidos: {TIPOS_PERMITIDOS}
 
             Regras de Tipo:
             - 'no débito' ou 'no pix' -> Débito
@@ -470,17 +716,21 @@ def tratar_post(event):
             Retorne APENAS um JSON: {{"description": "nome", "amount": float, "category": "categoria", "type": "tipo", "installments": int, "debtor_name": "nome ou null"}}
             """
             try:
-                response = client.models.generate_content(model=MODEL_ID, contents=prompt_ia)
-                dados    = json.loads(response.text.replace('```json', '').replace('```', '').strip())
+                ia_client  = _obter_cliente_ia()
+                response   = ia_client.models.generate_content(model=MODEL_ID, contents=prompt_ia)
+                dados_brut = _extrair_json_ia(response.text)
+                dados      = _normalizar_dados_transacao_ia(dados_brut)
             except Exception as e:
                 print("Erro IA Telegram:", e)
-                enviar_mensagem_telegram(chat_id, "⚠️ A IA está sobrecarregada no momento e não conseguiu processar sua requisição. Tente usar uma categoria ou tente amanhã.")
-                return {'statusCode': 200, 'body': json.dumps('Rate limit IA')}
+                enviar_mensagem_telegram(
+                    chat_id,
+                    "⚠️ A IA está sobrecarregada no momento e não conseguiu processar sua requisição. Tente usar uma categoria ou tente amanhã."
+                )
+                return _resposta(200, 'Rate limit IA')
 
-            # Validação SEC: amount deve ser positivo
-            if not isinstance(dados.get('amount'), (int, float)) or dados['amount'] <= 0:
+            if dados['amount'] <= 0:
                 enviar_mensagem_telegram(chat_id, "⚠️ Não consegui identificar um valor válido. Tente novamente.")
-                return {'statusCode': 200, 'body': json.dumps('Valor inválido')}
+                return _resposta(200, 'Valor inválido')
 
             # SEC08: raw_input_phrase removido — não armazenamos PII desnecessário
             table_transactions.put_item(Item={
@@ -491,10 +741,10 @@ def tratar_post(event):
                 'category':           dados['category'],
                 'type':               dados['type'],
                 'source':             'TELEGRAM_BOT',
-                'installments_total': dados.get('installments', 1),
-                'debtor_name':        dados.get('debtor_name'),
+                'installments_total': dados['installments'],
+                'debtor_name':        dados['debtor_name'],
                 'status':             'active',
-                'created_at':         datetime.datetime.now().isoformat()
+                'created_at':         datetime.datetime.now().isoformat(),
             })
 
             msg_confirmacao = (
@@ -504,62 +754,54 @@ def tratar_post(event):
                 f"🏷️ *Categoria:* {dados['category']}\n"
                 f"💳 *Tipo:* {dados['type']}"
             )
-            if dados.get('installments', 1) > 1:
+            if dados['installments'] > 1:
                 msg_confirmacao += f"\n🔢 *Parcelas:* {dados['installments']}"
-            if dados.get('debtor_name'):
+            if dados['debtor_name']:
                 msg_confirmacao += f"\n👤 *Devedor:* {dados['debtor_name']}"
 
             enviar_mensagem_telegram(chat_id, msg_confirmacao)
-            return {'statusCode': 200, 'body': json.dumps('Telegram processado')}
+            return _resposta(200, 'Telegram processado')
 
     # --- CASO 2: AUTENTICAÇÃO WEB (via POST com hash do Telegram) ---
     elif 'hash' in body and 'id' in body:
-        tg_hash     = body.get('hash')
+        tg_hash     = str(body.get('hash') or '')
         auth_date   = body.get('auth_date')
         telegram_id = body.get('id')
         first_name  = body.get('first_name', '')
 
-        data_check_list = [f"{k}={v}" for k, v in sorted(body.items()) if k != 'hash']
+        data_check_list   = [f"{k}={v}" for k, v in sorted(body.items()) if k != 'hash']
         data_check_string = "\n".join(data_check_list)
 
-        secret_key = hashlib.sha256(TELEGRAM_TOKEN.encode('utf-8')).digest()
+        secret_key = hashlib.sha256((TELEGRAM_TOKEN or '').encode('utf-8')).digest()
         local_hash = hmac.new(secret_key, data_check_string.encode('utf-8'), hashlib.sha256).hexdigest()
 
         if not hmac.compare_digest(local_hash, tg_hash):
-            return {
-                'statusCode': 401,
-                'headers': CORS_PUBLICO,
-                'body': json.dumps({'erro': 'Assinatura inválida.'})
-            }
+            return _resposta(401, {'erro': 'Assinatura inválida.'})
 
-        if time.time() - int(auth_date) > 86400:
-            return {
-                'statusCode': 401,
-                'headers': CORS_PUBLICO,
-                'body': json.dumps({'erro': 'Assinatura do Telegram expirada.'})
-            }
+        try:
+            auth_date_int = int(auth_date)
+        except (ValueError, TypeError):
+            return _resposta(401, {'erro': 'Data de autenticação inválida.'})
+
+        if time.time() - auth_date_int > 86400:
+            return _resposta(401, {'erro': 'Assinatura do Telegram expirada.'})
 
         id_final_usuario = _upsert_usuario_telegram(telegram_id, first_name)
 
         session_token = str(uuid.uuid4())
         expires_at    = (datetime.datetime.now() + datetime.timedelta(days=7)).isoformat()
-        # Sessão sem auth_code: já é válida para uso direto pelo frontend web
         table_sessions.put_item(Item={
             'token':      session_token,
             'user_id':    str(telegram_id),
-            'expires_at': expires_at
+            'expires_at': expires_at,
         })
 
-        return {
-            'statusCode': 200,
-            'headers': CORS_PUBLICO,
-            'body': json.dumps({
-                'login':           True,
-                'token_sessao':    session_token,
-                'user_id_interno': id_final_usuario,
-                'nome':            first_name
-            })
-        }
+        return _resposta(200, {
+            'login':           True,
+            'token_sessao':    session_token,
+            'user_id_interno': id_final_usuario,
+            'nome':            first_name,
+        })
 
     # --- CASO 3: IMPORTAÇÃO DE CSV (C6 BANK) ---
     elif 'csv_text' in body:
@@ -569,16 +811,19 @@ def tratar_post(event):
         if not validar_sessao(event, user_id):
             return _resposta_nao_autorizado()
 
-        # SEC07: Limite de tamanho de 1MB para evitar DoS no Lambda
-        if len(csv_text) > 1_048_576:
-            return {
-                'statusCode': 413,
-                'body': json.dumps({'erro': 'Arquivo CSV muito grande. Limite de 1MB.'})
-            }
+        if not isinstance(csv_text, str):
+            return _resposta(400, {'erro': 'Formato de CSV inválido.'})
 
+        # SEC07: Limite de tamanho de 1MB para evitar DoS no Lambda
+        if len(csv_text.encode('utf-8')) > 1_048_576:
+            return _resposta(413, {'erro': 'Arquivo CSV muito grande. Limite de 1MB.'})
 
         contagem = processar_csv_c6(user_id, csv_text)
-        return {'statusCode': 201, 'body': json.dumps(f'{contagem} itens processados!')}
+        return _resposta(201, {
+            'count':      contagem,
+            'importadas': contagem,
+            'message':    f'{contagem} itens processados!',
+        })
 
     # --- CASO 4: FRASE POR VOZ / DIRECT API ---
     elif 'frase' in body:
@@ -589,24 +834,26 @@ def tratar_post(event):
         # SEC06: Sanitiza antes de enviar ao Gemini
         frase_segura = sanitizar_frase(body['frase'])
         if not frase_segura:
-            return {'statusCode': 400, 'body': json.dumps({'erro': 'Frase inválida ou vazia.'})}
+            return _resposta(400, {'erro': 'Frase inválida ou vazia.'})
 
         prompt_ia = f"""
         Extraia os dados da frase: '{frase_segura}'
         Categorias: {MINHAS_CATEGORIAS}
-        Tipos permitidos: [Débito, Crédito à Vista, Crédito Parcelado, Emprestado]
+        Tipos permitidos: {TIPOS_PERMITIDOS}
 
         Retorne APENAS um JSON: {{"description": "nome", "amount": float, "category": "categoria", "type": "tipo", "installments": int, "debtor_name": "nome ou null"}}
         """
         try:
-            response = client.models.generate_content(model=MODEL_ID, contents=prompt_ia)
-            dados    = json.loads(response.text.replace('```json', '').replace('```', '').strip())
+            ia_client  = _obter_cliente_ia()
+            response   = ia_client.models.generate_content(model=MODEL_ID, contents=prompt_ia)
+            dados_brut = _extrair_json_ia(response.text)
+            dados      = _normalizar_dados_transacao_ia(dados_brut)
         except Exception as e:
             print("Erro IA Direct:", e)
-            return {'statusCode': 429, 'body': json.dumps({'erro': 'Limite de uso da IA excedido. Tente novamente mais tarde.'})}
+            return _resposta(429, {'erro': 'Limite de uso da IA excedido. Tente novamente mais tarde.'})
 
-        if not isinstance(dados.get('amount'), (int, float)) or dados['amount'] <= 0:
-            return {'statusCode': 422, 'body': json.dumps({'erro': 'Não foi possível identificar um valor válido na frase.'})}
+        if dados['amount'] <= 0:
+            return _resposta(422, {'erro': 'Não foi possível identificar um valor válido na frase.'})
 
         # SEC08: raw_input_phrase removido
         table_transactions.put_item(Item={
@@ -617,14 +864,14 @@ def tratar_post(event):
             'category':           dados['category'],
             'type':               dados['type'],
             'source':             'IA_CHAT',
-            'installments_total': dados.get('installments', 1),
-            'debtor_name':        dados.get('debtor_name'),
+            'installments_total': dados['installments'],
+            'debtor_name':        dados['debtor_name'],
             'status':             'active',
-            'created_at':         datetime.datetime.now().isoformat()
+            'created_at':         datetime.datetime.now().isoformat(),
         })
-        return {'statusCode': 201, 'body': json.dumps({'message': 'Salvo!', 'dados': dados})}
+        return _resposta(201, {'message': 'Salvo!', 'dados': dados})
 
-    return {'statusCode': 400, 'body': json.dumps({'erro': 'Requisição POST não reconhecida.'})}
+    return _resposta(400, {'erro': 'Requisição POST não reconhecida.'})
 
 
 # ============================================================
@@ -637,8 +884,8 @@ def tratar_get(event):
 
     # --- Rota pública: Página HTML de Login ---
     if action == 'telegram-login':
-        app_redirect_uri = params.get('app_redirect_uri', 'zentrix://auth/callback')
-        return servir_pagina_telegram_login(app_redirect_uri)
+        app_redirect_uri = _validar_redirect_uri(params.get('app_redirect_uri', DEFAULT_APP_REDIRECT_URI))
+        return servir_pagina_telegram_login(app_redirect_uri, event=event)
 
     # --- Rota pública: Callback server-side do Telegram ---
     if action == 'telegram-callback':
@@ -651,7 +898,7 @@ def tratar_get(event):
     # --- Rotas autenticadas ---
     user_id = params.get('user_id', ZENTRIX_USER_ID)
     if not user_id:
-        return {'statusCode': 400, 'body': json.dumps('user_id é obrigatório')}
+        return _resposta(400, {'erro': 'user_id é obrigatório'})
 
     if not validar_sessao(event, user_id):
         return _resposta_nao_autorizado()
@@ -659,41 +906,29 @@ def tratar_get(event):
     if action == 'summary':
         resumo = obter_resumo_usuario(user_id)
         if not resumo:
-            return {'statusCode': 404, 'body': json.dumps('Usuário não encontrado')}
-        return {
-            'statusCode': 200,
-            'body': json.dumps({
-                'metricas': {
-                    'total_gasto':             resumo['total_gasto'],
-                    'limite_definido':         resumo['limite_definido'],
-                    'saldo_disponivel':        resumo['saldo_disponivel'],
-                    'distribuicao_categorias': resumo['distribuicao_categorias']
-                },
-                'insight_ia': resumo['insight_ia']
-            }, default=_decimal_default)
-        }
+            return _resposta(404, {'erro': 'Usuário não encontrado'})
+        return _resposta(200, {
+            'metricas': {
+                'total_gasto':             resumo['total_gasto'],
+                'total_receber':           resumo['total_receber'],
+                'limite_definido':         resumo['limite_definido'],
+                'saldo_disponivel':        resumo['saldo_disponivel'],
+                'distribuicao_categorias': resumo['distribuicao_categorias'],
+            },
+            'insight_ia': resumo['insight_ia'],
+        })
     else:
-        # Busca todas as transações e ordena por created_at DESC em Python
-        # Substituição: SELECT * FROM transacoes ORDER BY created_at DESC
-        resp_tx = table_transactions.query(
-            KeyConditionExpression=Key('user_id').eq(str(user_id))
-        )
-        items = resp_tx.get('Items', [])
+        items = _listar_transacoes_usuario(user_id)
         items.sort(key=lambda x: x.get('created_at', ''), reverse=True)
 
         # Busca dados do usuário e remove password_hash (SEC)
         resp_user = table_users.get_item(Key={'id': str(user_id)})
         user_info = resp_user.get('Item')
         if user_info:
+            user_info = dict(user_info)
             user_info.pop('password_hash', None)
 
-        return {
-            'statusCode': 200,
-            'body': json.dumps(
-                {'transacoes': items, 'usuario': user_info},
-                default=_decimal_default
-            )
-        }
+        return _resposta(200, {'transacoes': items, 'usuario': user_info})
 
 
 # ============================================================
@@ -703,6 +938,8 @@ def tratar_get(event):
 def tratar_delete(event):
     try:
         body = json.loads(event.get('body', '{}') or '{}')
+        if not isinstance(body, dict):
+            return _resposta_erro_json()
     except json.JSONDecodeError:
         return _resposta_erro_json()
 
@@ -710,20 +947,19 @@ def tratar_delete(event):
     transacao_id = body.get('id')
 
     if not user_id or not transacao_id:
-        return {'statusCode': 400, 'body': json.dumps('Faltam chaves para deletar')}
+        return _resposta(400, {'erro': 'Faltam chaves para deletar'})
 
     if not validar_sessao(event, user_id):
         return _resposta_nao_autorizado()
 
-    # Substituição: DELETE FROM transacoes WHERE id = %s AND user_id = %s
-    # A chave composta (PK=user_id + SK=id) já garante o isolamento por usuário
+    # Chave composta (PK=user_id + SK=id) garante o isolamento por usuário (anti-IDOR)
     table_transactions.delete_item(
         Key={
             'user_id': str(user_id),
-            'id':      str(transacao_id)
+            'id':      str(transacao_id),
         }
     )
-    return {'statusCode': 200, 'body': json.dumps('Item removido.')}
+    return _resposta(200, {'message': 'Item removido.'})
 
 
 # ============================================================
@@ -733,6 +969,8 @@ def tratar_delete(event):
 def tratar_put(event):
     try:
         body = json.loads(event.get('body', '{}') or '{}')
+        if not isinstance(body, dict):
+            return _resposta_erro_json()
     except json.JSONDecodeError:
         return _resposta_erro_json()
 
@@ -745,91 +983,167 @@ def tratar_put(event):
     if action == 'update_transaction':
         transacao_id = body.get('id')
         if not transacao_id:
-            return {'statusCode': 400, 'body': json.dumps('ID da transação não fornecido')}
+            return _resposta(400, {'erro': 'ID da transação não fornecido'})
 
         update_parts = []
         expr_values  = {}
         expr_names   = {}
 
-        # Whitelist de campos permitidos para atualização.
-        # Todos passam por ExpressionAttributeNames para evitar conflito
-        # com palavras reservadas do DynamoDB (ex: 'status', 'description').
-        CAMPOS_PERMITIDOS = {'amount', 'description', 'category', 'status'}
+        CAMPOS_PERMITIDOS = ('amount', 'description', 'category', 'type', 'status')
         for campo in CAMPOS_PERMITIDOS:
             if campo not in body:
                 continue
+
             if campo == 'amount':
+                if isinstance(body[campo], bool):
+                    return _resposta(400, {'erro': 'Valor inválido'})
                 try:
                     val = float(body[campo])
-                    if val <= 0:
-                        return {'statusCode': 400, 'body': json.dumps('Valor deve ser positivo')}
-                    update_parts.append(f"#f_{campo} = :v_{campo}")
-                    expr_names[f'#f_{campo}']  = campo
-                    expr_values[f':v_{campo}'] = Decimal(str(val))
                 except (ValueError, TypeError):
-                    return {'statusCode': 400, 'body': json.dumps('Valor inválido')}
-            else:
+                    return _resposta(400, {'erro': 'Valor inválido'})
+                if val <= 0:
+                    return _resposta(400, {'erro': 'Valor deve ser positivo'})
+                update_parts.append(f"#f_{campo} = :v_{campo}")
+                expr_names[f'#f_{campo}']  = campo
+                expr_values[f':v_{campo}'] = Decimal(str(val))
+
+            elif campo == 'category':
+                if body[campo] not in MINHAS_CATEGORIAS:
+                    return _resposta(400, {'erro': 'Categoria inválida'})
                 update_parts.append(f"#f_{campo} = :v_{campo}")
                 expr_names[f'#f_{campo}']  = campo
                 expr_values[f':v_{campo}'] = body[campo]
 
-        if not update_parts:
-            return {'statusCode': 400, 'body': json.dumps('Nenhum campo válido para atualizar')}
+            elif campo == 'type':
+                if body[campo] not in TIPOS_PERMITIDOS:
+                    return _resposta(400, {'erro': 'Tipo de transação inválido'})
+                update_parts.append(f"#f_{campo} = :v_{campo}")
+                expr_names[f'#f_{campo}']  = campo
+                expr_values[f':v_{campo}'] = body[campo]
 
-        # Substituição: UPDATE transacoes SET ... WHERE id = %s AND user_id = %s
-        table_transactions.update_item(
-            Key={
-                'user_id': str(user_id),
-                'id':      str(transacao_id)
-            },
-            UpdateExpression="SET " + ", ".join(update_parts),
-            ExpressionAttributeNames=expr_names,
-            ExpressionAttributeValues=expr_values
-        )
-        return {'statusCode': 200, 'body': json.dumps({'message': 'Transação atualizada'})}
+            elif campo == 'description':
+                desc_limpa = sanitizar_frase(body[campo], max_chars=200)
+                if not desc_limpa:
+                    return _resposta(400, {'erro': 'Descrição inválida ou vazia'})
+                update_parts.append(f"#f_{campo} = :v_{campo}")
+                expr_names[f'#f_{campo}']  = campo
+                expr_values[f':v_{campo}'] = desc_limpa
+
+            elif campo == 'status':
+                status_val = body[campo]
+                if not isinstance(status_val, str) or not status_val.strip():
+                    return _resposta(400, {'erro': 'Status inválido'})
+                update_parts.append(f"#f_{campo} = :v_{campo}")
+                expr_names[f'#f_{campo}']  = campo
+                expr_values[f':v_{campo}'] = status_val.strip()
+
+        if not update_parts:
+            return _resposta(400, {'erro': 'Nenhum campo válido para atualizar'})
+
+        try:
+            table_transactions.update_item(
+                Key={
+                    'user_id': str(user_id),
+                    'id':      str(transacao_id),
+                },
+                UpdateExpression="SET " + ", ".join(update_parts),
+                ExpressionAttributeNames=expr_names,
+                ExpressionAttributeValues=expr_values,
+                ConditionExpression='attribute_exists(user_id) AND attribute_exists(id)',
+            )
+        except ClientError as e:
+            if e.response.get('Error', {}).get('Code') == 'ConditionalCheckFailedException':
+                return _resposta(404, {'erro': 'Transação não encontrada.'})
+            raise
+
+        return _resposta(200, {'message': 'Transação atualizada'})
 
     elif action == 'update_user':
         update_parts = []
         expr_values  = {}
         expr_names   = {}
 
-        # Substituição: UPDATE usuarios SET ... WHERE id = %s
-        # Valores monetários usam Decimal (boto3 não aceita float nativo)
         if 'salario_mensal' in body:
+            if isinstance(body['salario_mensal'], bool):
+                return _resposta(400, {'erro': 'Salário mensal inválido'})
+            try:
+                val_sal = float(body['salario_mensal'])
+            except (ValueError, TypeError):
+                return _resposta(400, {'erro': 'Salário mensal inválido'})
+            if val_sal < 0:
+                return _resposta(400, {'erro': 'Salário mensal não pode ser negativo'})
             update_parts.append("#f_salario = :v_salario")
             expr_names['#f_salario']  = 'salario_mensal'
-            expr_values[':v_salario'] = Decimal(str(body['salario_mensal']))
+            expr_values[':v_salario'] = Decimal(str(val_sal))
+
         if 'limite_mensal' in body:
+            if isinstance(body['limite_mensal'], bool):
+                return _resposta(400, {'erro': 'Limite mensal inválido'})
+            try:
+                val_lim = float(body['limite_mensal'])
+            except (ValueError, TypeError):
+                return _resposta(400, {'erro': 'Limite mensal inválido'})
+            if val_lim <= 0:
+                return _resposta(400, {'erro': 'Limite mensal deve ser maior que zero'})
             update_parts.append("#f_limite = :v_limite")
             expr_names['#f_limite']  = 'limite_mensal'
-            expr_values[':v_limite'] = Decimal(str(body['limite_mensal']))
+            expr_values[':v_limite'] = Decimal(str(val_lim))
+
         if 'dia_vencimento_fatura' in body:
+            if isinstance(body['dia_vencimento_fatura'], bool):
+                return _resposta(400, {'erro': 'Dia de vencimento inválido'})
+            try:
+                dia_venc = int(body['dia_vencimento_fatura'])
+            except (ValueError, TypeError):
+                return _resposta(400, {'erro': 'Dia de vencimento inválido'})
+            if not (1 <= dia_venc <= 31):
+                return _resposta(400, {'erro': 'Dia de vencimento deve estar entre 1 e 31'})
             update_parts.append("#f_dia_venc = :v_dia_venc")
             expr_names['#f_dia_venc']  = 'dia_vencimento_fatura'
-            expr_values[':v_dia_venc'] = body['dia_vencimento_fatura']
+            expr_values[':v_dia_venc'] = dia_venc
 
         if not update_parts:
-            return {'statusCode': 400, 'body': json.dumps('Nenhum campo para atualizar no usuário')}
+            return _resposta(400, {'erro': 'Nenhum campo para atualizar no usuário'})
 
         table_users.update_item(
             Key={'id': str(user_id)},
             UpdateExpression="SET " + ", ".join(update_parts),
             ExpressionAttributeNames=expr_names,
-            ExpressionAttributeValues=expr_values
+            ExpressionAttributeValues=expr_values,
         )
-        return {'statusCode': 200, 'body': json.dumps({'message': 'Perfil atualizado'})}
+        return _resposta(200, {'message': 'Perfil atualizado'})
 
     else:
-        return {'statusCode': 400, 'body': json.dumps('Ação PUT desconhecida')}
+        return _resposta(400, {'erro': 'Ação PUT desconhecida'})
 
 
 # ============================================================
 # 9. PÁGINA HTML DE LOGIN (Pública)
 # ============================================================
 
-def servir_pagina_telegram_login(app_redirect_uri):
-    callback_base = "https://agog0k90kc.execute-api.sa-east-1.amazonaws.com/default/api-financas-ia?action=telegram-callback"
-    callback_url  = callback_base + "&app_redirect_uri=" + urllib.parse.quote(app_redirect_uri)
+def _derivar_base_url(event):
+    """Deriva a URL base dinamicamente a partir do evento HTTP ou usa o fallback de produção."""
+    if not event or not isinstance(event, dict):
+        return DEFAULT_API_BASE_URL
+
+    headers = event.get('headers') or {}
+    req_ctx = event.get('requestContext') or {}
+    host = headers.get('Host') or headers.get('host') or req_ctx.get('domainName')
+    path = req_ctx.get('path') or event.get('rawPath') or event.get('path')
+    proto = headers.get('X-Forwarded-Proto') or headers.get('x-forwarded-proto') or 'https'
+
+    if host and path:
+        return f"{proto}://{host}{path}"
+    return DEFAULT_API_BASE_URL
+
+
+def servir_pagina_telegram_login(app_redirect_uri, event=None):
+    redirect_seguro = _validar_redirect_uri(app_redirect_uri)
+    base_url        = _derivar_base_url(event)
+    callback_url    = (
+        f"{base_url}?action=telegram-callback"
+        f"&app_redirect_uri={urllib.parse.quote(redirect_seguro, safe='')}"
+    )
 
     html = """<!DOCTYPE html>
 <html lang="pt-BR">
@@ -906,10 +1220,10 @@ def servir_pagina_telegram_login(app_redirect_uri):
     return {
         'statusCode': 200,
         'headers': {
+            **CORS_HEADERS,
             'Content-Type': 'text/html',
-            'Access-Control-Allow-Origin': '*'  # Pública: retorna HTML para o browser
         },
-        'body': html
+        'body': html,
     }
 
 
@@ -923,33 +1237,45 @@ def tratar_telegram_callback(params):
     gera um auth_code temporário (válido 10 min) e o app
     faz um GET ?action=trocar-codigo para pegar o token real.
     """
-    app_redirect_uri = params.get('app_redirect_uri', 'zentrix://auth/callback')
-    tg_hash    = params.get('hash', '')
-    auth_date  = params.get('auth_date', '0')
-    telegram_id = params.get('id', '')
-    first_name  = params.get('first_name', 'Usuario')
+    app_redirect_uri = _validar_redirect_uri(params.get('app_redirect_uri', DEFAULT_APP_REDIRECT_URI))
+    tg_hash          = params.get('hash', '')
+    auth_date        = params.get('auth_date', '0')
+    telegram_id      = params.get('id', '')
+    first_name       = params.get('first_name', 'Usuario')
 
     def redirect_error(error_code):
         sep = '&' if '?' in app_redirect_uri else '?'
         return {
             'statusCode': 302,
-            'headers': {'Location': f'{app_redirect_uri}{sep}error={error_code}'},
-            'body': ''
+            'headers': {
+                **CORS_HEADERS,
+                'Location': f'{app_redirect_uri}{sep}error={error_code}',
+            },
+            'body': '',
         }
 
     if not tg_hash or not telegram_id:
         return redirect_error('dados_incompletos')
 
     # Validar hash HMAC-SHA256
-    data_check_list   = [f"{k}={params[k]}" for k in sorted(params.keys()) if k not in ['hash', 'action', 'app_redirect_uri']]
+    data_check_list = [
+        f"{k}={params[k]}"
+        for k in sorted(params.keys())
+        if k not in ('hash', 'action', 'app_redirect_uri')
+    ]
     data_check_string = "\n".join(data_check_list)
-    secret_key = hashlib.sha256(TELEGRAM_TOKEN.encode('utf-8')).digest()
+    secret_key = hashlib.sha256((TELEGRAM_TOKEN or '').encode('utf-8')).digest()
     local_hash = hmac.new(secret_key, data_check_string.encode('utf-8'), hashlib.sha256).hexdigest()
 
     if not hmac.compare_digest(local_hash, tg_hash):
         return redirect_error('hash_invalido')
 
-    if time.time() - int(auth_date) > 86400:
+    try:
+        auth_date_int = int(auth_date)
+    except (ValueError, TypeError):
+        return redirect_error('dados_incompletos')
+
+    if time.time() - auth_date_int > 86400:
         return redirect_error('expirado')
 
     # Garante que o usuário existe no DynamoDB
@@ -966,14 +1292,14 @@ def tratar_telegram_callback(params):
         'user_id':              str(telegram_id),
         'expires_at':           expires_at,
         'auth_code':            auth_code,
-        'auth_code_expires_at': auth_code_expires_at
+        'auth_code_expires_at': auth_code_expires_at,
     })
 
     # Apenas auth_code e user_id_interno na URL — token real NUNCA exposto
     callback_params = urllib.parse.urlencode({
         'auth_code':       auth_code,
         'user_id_interno': str(telegram_id),
-        'nome':            first_name
+        'nome':            first_name,
     })
     sep = '&' if '?' in app_redirect_uri else '?'
     redirect_url = app_redirect_uri + sep + callback_params
@@ -981,10 +1307,10 @@ def tratar_telegram_callback(params):
     return {
         'statusCode': 302,
         'headers': {
+            **CORS_HEADERS,
             'Location': redirect_url,
-            'Access-Control-Allow-Origin': '*'
         },
-        'body': ''
+        'body': '',
     }
 
 
@@ -996,55 +1322,46 @@ def tratar_troca_codigo(params):
     """
     SEC03: O app envia o auth_code (que veio na URL) e recebe o
     token_sessao real em JSON. O auth_code é invalidado após o uso.
-    Substituição: Query no GSI auth_code-index da tabela ZentrixSessions.
     """
     auth_code = params.get('code', '')
     if not auth_code:
-        return {'statusCode': 400, 'body': json.dumps({'erro': 'Código inválido.'})}
+        return _resposta(400, {'erro': 'Código inválido.'})
 
-    # Query no GSI auth_code-index
     resp = table_sessions.query(
         IndexName='auth_code-index',
-        KeyConditionExpression=Key('auth_code').eq(auth_code)
+        KeyConditionExpression=Key('auth_code').eq(auth_code),
     )
     items = resp.get('Items', [])
     if not items:
-        return {'statusCode': 401, 'body': json.dumps({'erro': 'Código inválido ou já utilizado.'})}
+        return _resposta(401, {'erro': 'Código inválido ou já utilizado.'})
 
-    # Como o GSI foi configurado como Keys only (ou All), pegamos o token
     session_gsi = items[0]
     token = session_gsi.get('token')
     if not token:
-        return {'statusCode': 401, 'body': json.dumps({'erro': 'Sessão inválida.'})}
+        return _resposta(401, {'erro': 'Sessão inválida.'})
 
-    # Busca a sessão completa pela chave primária (token)
     resp_sess = table_sessions.get_item(Key={'token': token})
     session = resp_sess.get('Item')
     if not session:
-        return {'statusCode': 401, 'body': json.dumps({'erro': 'Sessão não encontrada.'})}
+        return _resposta(401, {'erro': 'Sessão não encontrada.'})
 
-    # Valida se o auth_code ainda está presente e dentro do prazo
     auth_code_expires_at = session.get('auth_code_expires_at')
     if not auth_code_expires_at:
-        return {'statusCode': 401, 'body': json.dumps({'erro': 'Código inválido ou já utilizado.'})}
+        return _resposta(401, {'erro': 'Código inválido ou já utilizado.'})
 
     try:
         if datetime.datetime.fromisoformat(auth_code_expires_at) < datetime.datetime.now():
-            return {'statusCode': 401, 'body': json.dumps({'erro': 'Código expirado. Faça login novamente.'})}
+            return _resposta(401, {'erro': 'Código expirado. Faça login novamente.'})
     except Exception:
-        pass
+        return _resposta(401, {'erro': 'Código inválido.'})
 
-    # Invalida o auth_code removendo-o da sessão.
-    # Como o DynamoDB suporta Sparse Index, ao remover auth_code o item sai automaticamente do GSI auth_code-index!
+    # Invalida o auth_code removendo-o da sessão (sai automaticamente do GSI Sparse auth_code-index)
     table_sessions.update_item(
         Key={'token': token},
-        UpdateExpression="REMOVE auth_code, auth_code_expires_at"
+        UpdateExpression="REMOVE auth_code, auth_code_expires_at",
     )
 
-    return {
-        'statusCode': 200,
-        'body': json.dumps({
-            'token_sessao': session['token'],
-            'user_id_interno': str(session['user_id'])
-        })
-    }
+    return _resposta(200, {
+        'token_sessao':    session['token'],
+        'user_id_interno': str(session['user_id']),
+    })
